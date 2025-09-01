@@ -2,25 +2,23 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
-import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime
 import base64
 from io import BytesIO
 import logging
+import openpyxl
+from openpyxl.styles import Alignment, Border, Side, Font
+from datetime import datetime
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Function to process the data
-def process_data(positions_file, nfo_bhav_file, bfo_bhav_file, expiry_nfo, expiry_bfo, include_unrealized_nfo, include_unrealized_bfo):
+def process_data(positions_file, nfo_bhav_file, bfo_bhav_file, expiry_nfo, expiry_bfo, include_settlement_nfo, include_settlement_bfo):
     try:
-        # Read the files
+        # Read the positions file
         df = pd.read_csv(positions_file)
-        df_bhav_nfo = pd.read_csv(nfo_bhav_file)
-        df_bhav_bfo = pd.read_csv(bfo_bhav_file)
-        logger.info("CSV files loaded successfully")
+        logger.info("Positions CSV loaded successfully")
 
         # Verify required columns
         required_columns = ['Exchange', 'Symbol', 'Net Qty', 'Buy Avg Price', 'Sell Avg Price', 'Sell Qty', 'Buy Qty', 'Realized Profit', 'Unrealized Profit']
@@ -40,52 +38,70 @@ def process_data(positions_file, nfo_bhav_file, bfo_bhav_file, expiry_nfo, expir
         df_bfo = df[df["Exchange"] == "BFO"].copy()
         logger.info("Data split into NFO and BFO")
 
-        # Process NFO Bhavcopy
-        if 'CONTRACT_D' not in df_bhav_nfo.columns:
-            raise ValueError("CONTRACT_D column not found in NFO bhavcopy")
-        df_bhav_nfo["Date"] = df_bhav_nfo["CONTRACT_D"].str.extract(r'(\d{2}-[A-Z]{3}-\d{4})')
-        df_bhav_nfo["Symbol"] = df_bhav_nfo["CONTRACT_D"].str.extract(r'^(.*?)(\d{2}-[A-Z]{3}-\d{4})')[0]
-        df_bhav_nfo["Strike_Type"] = df_bhav_nfo["CONTRACT_D"].str.extract(r'(PE\d+|CE\d+)$')
-        df_bhav_nfo["Date"] = pd.to_datetime(df_bhav_nfo["Date"], format="%d-%b-%Y")
-        df_bhav_nfo["Strike_Type"] = df_bhav_nfo["Strike_Type"].str.replace(
-            r'^(PE|CE)(\d+)$', r'\2\1', regex=True
-        )
+        # Initialize variables
+        total_settlement_pnl_nfo = 0
+        total_settlement_pnl_bfo = 0
+        df_bhav_nfo = pd.DataFrame()
+        df_bhav_bfo = pd.DataFrame()
 
-        target_symbol = "OPTIDXNIFTY"
-        df_bhav_nfo = df_bhav_nfo[
-            (df_bhav_nfo["Date"] == pd.to_datetime(expiry_nfo)) &
-            (df_bhav_nfo["Symbol"] == target_symbol)
-        ]
+        # Process NFO Bhavcopy if settlement is included
+        if include_settlement_nfo:
+            if nfo_bhav_file is None:
+                raise ValueError("NFO bhavcopy file is required when settlement PNL for NFO is enabled")
+            df_bhav_nfo = pd.read_csv(nfo_bhav_file)
+            logger.info("NFO bhavcopy loaded successfully")
 
-        df_nfo["Strike_Type"] = df_nfo["Symbol"].str.extract(r'(\d+[A-Z]{2})$')
-        df_nfo['Strike'] = df_nfo['Strike_Type'].str[:-2].astype(float, errors='ignore')
-        df_nfo['Option_Type'] = df_nfo['Strike_Type'].str[-2:]
+            if 'CONTRACT_D' not in df_bhav_nfo.columns:
+                raise ValueError("CONTRACT_D column not found in NFO bhavcopy")
+            df_bhav_nfo["Date"] = df_bhav_nfo["CONTRACT_D"].str.extract(r'(\d{2}-[A-Z]{3}-\d{4})')
+            df_bhav_nfo["Symbol"] = df_bhav_nfo["CONTRACT_D"].str.extract(r'^(.*?)(\d{2}-[A-Z]{3}-\d{4})')[0]
+            df_bhav_nfo["Strike_Type"] = df_bhav_nfo["CONTRACT_D"].str.extract(r'(PE\d+|CE\d+)$')
+            df_bhav_nfo["Date"] = pd.to_datetime(df_bhav_nfo["Date"], format="%d-%b-%Y")
+            df_bhav_nfo["Strike_Type"] = df_bhav_nfo["Strike_Type"].str.replace(
+                r'^(PE|CE)(\d+)$', r'\2\1', regex=True
+            )
 
-        # Merge to get SETTLEMENT
-        df_nfo = df_nfo.merge(
-            df_bhav_nfo[["Strike_Type", "SETTLEMENT"]],
-            on="Strike_Type",
-            how="left"
-        )
-        logger.info("NFO data merged with bhavcopy")
+            target_symbol = "OPTIDXNIFTY"
+            df_bhav_nfo = df_bhav_nfo[
+                (df_bhav_nfo["Date"] == pd.to_datetime(expiry_nfo)) &
+                (df_bhav_nfo["Symbol"] == target_symbol)
+            ]
 
-        # Process BFO Bhavcopy
-        if 'Market Summary Date' not in df_bhav_bfo.columns or 'Expiry Date' not in df_bhav_bfo.columns or 'Series Code' not in df_bhav_bfo.columns:
-            raise ValueError("Required columns missing in BFO bhavcopy")
-        df_bhav_bfo["Date"] = pd.to_datetime(df_bhav_bfo["Market Summary Date"], format="%d %b %Y", errors="coerce")
-        df_bhav_bfo["Expiry Date"] = pd.to_datetime(df_bhav_bfo["Expiry Date"], format="%d %b %Y", errors="coerce")
-        df_bhav_bfo["Symbols"] = df_bhav_bfo["Series Code"].astype(str).str[-7:]
+            df_nfo["Strike_Type"] = df_nfo["Symbol"].str.extract(r'(\d+[A-Z]{2})$')
+            df_nfo['Strike'] = df_nfo['Strike_Type'].str[:-2].astype(float, errors='ignore')
+            df_nfo['Option_Type'] = df_nfo['Strike_Type'].str[-2:]
 
-        df_bhav_bfo = df_bhav_bfo[
-            (df_bhav_bfo["Expiry Date"] == pd.to_datetime(expiry_bfo))
-        ]
+            # Merge to get SETTLEMENT
+            df_nfo = df_nfo.merge(
+                df_bhav_nfo[["Strike_Type", "SETTLEMENT"]],
+                on="Strike_Type",
+                how="left"
+            )
+            logger.info("NFO data merged with bhavcopy")
 
-        df_bfo["Symbol"] = df_bfo["Symbol"].astype(str).str.strip()
-        df_bhav_bfo["Symbols"] = df_bhav_bfo["Symbols"].astype(str).str.strip()
+        # Process BFO Bhavcopy if settlement is included
+        if include_settlement_bfo:
+            if bfo_bhav_file is None:
+                raise ValueError("BFO bhavcopy file is required when settlement PNL for BFO is enabled")
+            df_bhav_bfo = pd.read_csv(bfo_bhav_file)
+            logger.info("BFO bhavcopy loaded successfully")
 
-        bhav_mapping = df_bhav_bfo.drop_duplicates(subset="Symbols", keep="last").set_index("Symbols")["Close Price"]
-        df_bfo["Close Price"] = df_bfo["Symbol"].map(bhav_mapping)
-        logger.info("BFO data processed")
+            if 'Market Summary Date' not in df_bhav_bfo.columns or 'Expiry Date' not in df_bhav_bfo.columns or 'Series Code' not in df_bhav_bfo.columns:
+                raise ValueError("Required columns missing in BFO bhavcopy")
+            df_bhav_bfo["Date"] = pd.to_datetime(df_bhav_bfo["Market Summary Date"], format="%d %b %Y", errors="coerce")
+            df_bhav_bfo["Expiry Date"] = pd.to_datetime(df_bhav_bfo["Expiry Date"], format="%d %b %Y", errors="coerce")
+            df_bhav_bfo["Symbols"] = df_bhav_bfo["Series Code"].astype(str).str[-7:]
+
+            df_bhav_bfo = df_bhav_bfo[
+                (df_bhav_bfo["Expiry Date"] == pd.to_datetime(expiry_bfo))
+            ]
+
+            df_bfo["Symbol"] = df_bfo["Symbol"].astype(str).str.strip()
+            df_bhav_bfo["Symbols"] = df_bhav_bfo["Symbols"].astype(str).str.strip()
+
+            bhav_mapping = df_bhav_bfo.drop_duplicates(subset="Symbols", keep="last").set_index("Symbols")["Close Price"]
+            df_bfo["Close Price"] = df_bfo["Symbol"].map(bhav_mapping)
+            logger.info("BFO data processed")
 
         # Calculate Realized PNL for NFO
         conditions = [
@@ -102,10 +118,9 @@ def process_data(positions_file, nfo_bhav_file, bfo_bhav_file, expiry_nfo, expir
         df_nfo["Matching_Realized"] = df_nfo["Realized Profit"] == df_nfo["Calculated_Realized_PNL"]
         df_nfo["Matching_Realized"] = df_nfo["Matching_Realized"].replace({True: "TRUE", False: ""})
 
-        # Calculate Unrealized PNL for NFO (if enabled)
-        total_unrealized_pnl_nfo = 0
-        if include_unrealized_nfo:
-            df_nfo["Calculated_Unrealized_PNL"] = np.select(
+        # Calculate Settlement PNL for NFO (if enabled)
+        if include_settlement_nfo:
+            df_nfo["Calculated_Settlement_PNL"] = np.select(
                 [
                     df_nfo["Net Qty"] > 0,
                     df_nfo["Net Qty"] < 0
@@ -116,12 +131,12 @@ def process_data(positions_file, nfo_bhav_file, bfo_bhav_file, expiry_nfo, expir
                 ],
                 default=0
             )
-            df_nfo["Matching_Unrealized"] = df_nfo["Unrealized Profit"] == df_nfo["Calculated_Unrealized_PNL"]
-            df_nfo["Matching_Unrealized"] = df_nfo["Matching_Unrealized"].replace({True: "TRUE", False: ""})
-            total_unrealized_pnl_nfo = df_nfo["Calculated_Unrealized_PNL"].fillna(0).sum()
+            df_nfo["Matching_Settlement"] = df_nfo["Unrealized Profit"] == df_nfo["Calculated_Settlement_PNL"]
+            df_nfo["Matching_Settlement"] = df_nfo["Matching_Settlement"].replace({True: "TRUE", False: ""})
+            total_settlement_pnl_nfo = df_nfo["Calculated_Settlement_PNL"].fillna(0).sum()
         else:
-            df_nfo["Calculated_Unrealized_PNL"] = 0
-            df_nfo["Matching_Unrealized"] = ""
+            df_nfo["Calculated_Settlement_PNL"] = 0
+            df_nfo["Matching_Settlement"] = ""
 
         total_realized_pnl_nfo = df_nfo["Calculated_Realized_PNL"].fillna(0).sum()
 
@@ -140,311 +155,314 @@ def process_data(positions_file, nfo_bhav_file, bfo_bhav_file, expiry_nfo, expir
         df_bfo["Matching_Realized"] = df_bfo["Realized Profit"] == df_bfo["Calculated_Realized_PNL"]
         df_bfo["Matching_Realized"] = df_bfo["Matching_Realized"].replace({True: "TRUE", False: ""})
 
-        # Calculate Unrealized PNL for BFO (if enabled)
-        total_unrealized_pnl_bfo = 0
-        if include_unrealized_bfo:
+        # Calculate Settlement PNL for BFO (if enabled)
+        if include_settlement_bfo:
             long_condition = df_bfo["Net Qty"] > 0
-            df_bfo.loc[long_condition, "Calculated_Unrealized_PNL"] = (
+            df_bfo.loc[long_condition, "Calculated_Settlement_PNL"] = (
                 (df_bfo["Close Price"] - df_bfo["Buy Avg Price"]) * abs(df_bfo["Net Qty"])
             )
             short_condition = df_bfo["Net Qty"] < 0
-            df_bfo.loc[short_condition, "Calculated_Unrealized_PNL"] = (
+            df_bfo.loc[short_condition, "Calculated_Settlement_PNL"] = (
                 (df_bfo["Sell Avg Price"] - df_bfo["Close Price"]) * abs(df_bfo["Net Qty"])
             )
-            df_bfo.loc[df_bfo["Net Qty"] == 0, "Calculated_Unrealized_PNL"] = 0
-            df_bfo["Matching_Unrealized"] = df_bfo["Unrealized Profit"] == df_bfo["Calculated_Unrealized_PNL"]
-            df_bfo["Matching_Unrealized"] = df_bfo["Matching_Unrealized"].replace({True: "TRUE", False: ""})
-            total_unrealized_pnl_bfo = df_bfo["Calculated_Unrealized_PNL"].fillna(0).sum()
+            df_bfo.loc[df_bfo["Net Qty"] == 0, "Calculated_Settlement_PNL"] = 0
+            df_bfo["Matching_Settlement"] = df_bfo["Unrealized Profit"] == df_bfo["Calculated_Settlement_PNL"]
+            df_bfo["Matching_Settlement"] = df_bfo["Matching_Settlement"].replace({True: "TRUE", False: ""})
+            total_settlement_pnl_bfo = df_bfo["Calculated_Settlement_PNL"].fillna(0).sum()
         else:
-            df_bfo["Calculated_Unrealized_PNL"] = 0
-            df_bfo["Matching_Unrealized"] = ""
+            df_bfo["Calculated_Settlement_PNL"] = 0
+            df_bfo["Matching_Settlement"] = ""
 
         total_realized_pnl_bfo = df_bfo["Calculated_Realized_PNL"].fillna(0).sum()
 
         # Overall totals
         overall_realized = total_realized_pnl_nfo + total_realized_pnl_bfo
-        overall_unrealized = total_unrealized_pnl_nfo + total_unrealized_pnl_bfo
-        grand_total = overall_realized + overall_unrealized
-
-        # Aggregated data for insights
-        if 'Symbol' not in df_nfo.columns:
-            df_nfo['Symbol'] = df_nfo['Strike_Type']
-        if 'Symbol' not in df_bfo.columns:
-            df_bfo['Symbol'] = df_bfo['Symbol']
-
-        nfo_agg = df_nfo.groupby('Symbol').agg({
-            'Calculated_Realized_PNL': 'sum',
-            'Calculated_Unrealized_PNL': 'sum'
-        }).reset_index()
-        nfo_agg['Total_PNL'] = nfo_agg['Calculated_Realized_PNL'] + nfo_agg['Calculated_Unrealized_PNL']
-
-        bfo_agg = df_bfo.groupby('Symbol').agg({
-            'Calculated_Realized_PNL': 'sum',
-            'Calculated_Unrealized_PNL': 'sum'
-        }).reset_index()
-        bfo_agg['Total_PNL'] = bfo_agg['Calculated_Realized_PNL'] + bfo_agg['Calculated_Unrealized_PNL']
-
-        # Top gainers/losers
-        top_gainers_nfo = nfo_agg.nlargest(5, 'Total_PNL')
-        top_losers_nfo = nfo_agg.nsmallest(5, 'Total_PNL')
-        top_gainers_bfo = bfo_agg.nlargest(5, 'Total_PNL')
-        top_losers_bfo = bfo_agg.nsmallest(5, 'Total_PNL')
+        overall_settlement = total_settlement_pnl_nfo + total_settlement_pnl_bfo
+        grand_total = overall_realized + overall_settlement
 
         logger.info("Data processing completed successfully")
         return {
             "df_nfo": df_nfo,
             "df_bfo": df_bfo,
-            "nfo_agg": nfo_agg,
-            "bfo_agg": bfo_agg,
-            "top_gainers_nfo": top_gainers_nfo,
-            "top_losers_nfo": top_losers_nfo,
-            "top_gainers_bfo": top_gainers_bfo,
-            "top_losers_bfo": top_losers_bfo,
             "total_realized_nfo": total_realized_pnl_nfo,
-            "total_unrealized_nfo": total_unrealized_pnl_nfo,
+            "total_settlement_nfo": total_settlement_pnl_nfo,
             "total_realized_bfo": total_realized_pnl_bfo,
-            "total_unrealized_bfo": total_unrealized_pnl_bfo,
+            "total_settlement_bfo": total_settlement_pnl_bfo,
             "overall_realized": overall_realized,
-            "overall_unrealized": overall_unrealized,
+            "overall_settlement": overall_settlement,
             "grand_total": grand_total
         }
     except Exception as e:
         logger.error(f"Error in process_data: {str(e)}")
         raise
 
-# Function to get CSV download link
-def get_csv_download_link(df, filename):
-    csv = df.to_csv(index=False)
-    b64 = base64.b64encode(csv.encode()).decode()
-    return f'<a href="data:file/csv;base64,{b64}" download="{filename}">Download {filename}</a>'
+# Function to get Excel download link with centralized formatting using openpyxl
+def get_excel_download_link(df, filename):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='PNL Data')
+        worksheet = writer.sheets['PNL Data']
+        
+        # Center align all data
+        for row in worksheet.rows:
+            for cell in row:
+                cell.alignment = Alignment(horizontal='center')
+        
+        # Apply good formatting (bold headers, borders, etc.)
+        for cell in worksheet[1]:  # Row 1 is the header row
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = openpyxl.styles.PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+        
+        # Add borders
+        for row in worksheet.rows:
+            for cell in row:
+                cell.border = Border(left=Side(style='thin'),
+                                   right=Side(style='thin'),
+                                   top=Side(style='thin'),
+                                   bottom=Side(style='thin'))
+    
+    excel_data = output.getvalue()
+    b64 = base64.b64encode(excel_data).decode()
+    return f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{filename}.xlsx" class="text-blue-600 hover:text-blue-800 font-semibold">Download {filename}.xlsx</a>'
 
-# Function to get color based on value
-def get_color(value):
-    return '#4CAF50' if value > 0 else '#F44336' if value < 0 else '#757575'
+# Streamlit App Configuration
+st.set_page_config(
+    page_title="Ultimate Financial PNL Dashboard",
+    layout="wide",
+    page_icon="📊",
+    initial_sidebar_state="expanded"
+)
 
-# Streamlit App
-st.set_page_config(page_title="Ultimate Financial PNL Dashboard", layout="wide", page_icon="📊")
-
-# Custom CSS for enhanced UI/UX
+# Enhanced Custom CSS with Tailwind CSS and Animations
 st.markdown("""
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
     <style>
-    .main {background: linear-gradient(to bottom, #f8f9fa, #e9ecef); font-family: 'Roboto', sans-serif;}
-    .stButton>button {background: linear-gradient(45deg, #007bff, #00d4ff); color: white; border: none; padding: 12px 24px; border-radius: 8px; font-weight: bold; transition: all 0.3s;}
-    .stButton>button:hover {background: linear-gradient(45deg, #0056b3, #0096cc); transform: scale(1.05);}
-    .stDateInput>div>div>input {border-radius: 8px; padding: 10px; border: 2px solid #007bff;}
-    .stFileUploader>div>button {background: linear-gradient(45deg, #28a745, #34c759); color: white; border-radius: 8px; padding: 10px;}
-    .stCheckbox label {font-size: 16px; color: #333;}
-    .metric-card {background: white; padding: 20px; border-radius: 12px; box-shadow: 0 6px 12px rgba(0,0,0,0.1); text-align: center; transition: transform 0.3s;}
-    .metric-card:hover {transform: translateY(-5px);}
-    .metric-label {font-size: 18px; color: #6c757d; margin-bottom: 10px;}
-    .metric-value {font-size: 28px; font-weight: bold;}
-    .stTabs [data-baseweb="tab"] {font-size: 16px; font-weight: bold; padding: 10px 20px;}
-    .insights-box {background: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); margin-top: 20px;}
-    footer {visibility: hidden;}
-    .chart-container {padding: 20px; background: white; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);}
+    body {
+        font-family: 'Inter', sans-serif;
+        background: linear-gradient(135deg, #f3f4f6, #e5e7eb);
+    }
+    .sidebar .sidebar-content {
+        background: #ffffff;
+        border-radius: 0.5rem;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        padding: 1rem;
+    }
+    .stButton>button {
+        background: linear-gradient(45deg, #3b82f6, #60a5fa);
+        color: white;
+        border: none;
+        padding: 0.75rem 1.5rem;
+        border-radius: 0.5rem;
+        font-weight: 600;
+        transition: all 0.3s ease;
+        width: 100%;
+    }
+    .stButton>button:hover {
+        background: linear-gradient(45deg, #2563eb, #3b82f6);
+        transform: translateY(-2px);
+        box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+    }
+    .stDateInput input {
+        border: 2px solid #3b82f6;
+        border-radius: 0.5rem;
+        padding: 0.5rem;
+        background: #ffffff;
+    }
+    .stFileUploader button {
+        background: linear-gradient(45deg, #10b981, #34d399);
+        color: white;
+        border-radius: 0.5rem;
+        padding: 0.75rem;
+    }
+    .stFileUploader button:hover {
+        background: linear-gradient(45deg, #059669, #10b981);
+    }
+    .stCheckbox label {
+        font-size: 1rem;
+        color: #1f2937;
+    }
+    .metric-card {
+        background: #ffffff;
+        padding: 1.5rem;
+        border-radius: 0.75rem;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        text-align: center;
+        transition: transform 0.3s ease;
+    }
+    .metric-card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+    }
+    .metric-label {
+        font-size: 1.1rem;
+        color: #6b7280;
+        margin-bottom: 0.5rem;
+    }
+    .metric-value {
+        font-size: 1.75rem;
+        font-weight: 700;
+    }
+    .stTabs [data-baseweb="tab"] {
+        font-size: 1.1rem;
+        font-weight: 600;
+        padding: 0.75rem 1.5rem;
+        border-radius: 0.5rem;
+        transition: all 0.3s ease;
+    }
+    .stTabs [data-baseweb="tab"]:hover {
+        background: #e5e7eb;
+    }
+    .insights-box {
+        background: #ffffff;
+        padding: 1.5rem;
+        border-radius: 0.5rem;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        margin-top: 1.5rem;
+    }
+    .chart-container {
+        background: #ffffff;
+        padding: 1.5rem;
+        border-radius: 0.75rem;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        margin-bottom: 1.5rem;
+    }
+    .header-text {
+        font-size: 2.25rem;
+        font-weight: 800;
+        color: #1f2937;
+        text-align: center;
+        margin-bottom: 1rem;
+    }
+    .subheader-text {
+        font-size: 1.25rem;
+        color: #4b5563;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    footer { visibility: hidden; }
     </style>
 """, unsafe_allow_html=True)
 
-# Theme toggle
-theme = st.sidebar.selectbox("🌗 Theme", ["Light", "Dark"])
-if theme == "Dark":
-    st.markdown("""
-        <style>
-        .main {background: linear-gradient(to bottom, #343a40, #495057); color: #f8f9fa;}
-        .metric-card {background: #495057;}
-        .metric-label {color: #ced4da;}
-        .insights-box {background: #495057;}
-        .chart-container {background: #343a40;}
-        </style>
-    """, unsafe_allow_html=True)
-
-# Sidebar for inputs
+# Theme toggle with improved styling
 with st.sidebar:
-    st.header("📁 Upload Your Data")
-    positions_file = st.file_uploader("Positions CSV", type="csv", help="Upload VS20 22 AUG 2025 POSITIONS(EOD).csv")
-    nfo_bhav_file = st.file_uploader("NFO Bhavcopy", type="csv", help="Upload op220825.csv")
-    bfo_bhav_file = st.file_uploader("BFO Bhavcopy", type="csv", help="Upload MS_20250822-01.csv")
+    st.markdown('<h2 class="text-lg font-bold text-gray-800 dark:text-gray-200 mb-4">🌗 Theme</h2>', unsafe_allow_html=True)
+    theme = st.selectbox("Select Theme", ["Light", "Dark"], key="theme_select", help="Switch between light and dark themes")
+    if theme == "Dark":
+        st.markdown("""
+            <style>
+            body {
+                background: linear-gradient(135deg, #1f2937, #374151);
+                color: #f3f4f6;
+            }
+            .sidebar .sidebar-content {
+                background: #374151;
+            }
+            .metric-card, .insights-box, .chart-container {
+                background: #4b5563;
+            }
+            .metric-label {
+                color: #d1d5db;
+            }
+            .header-text, .subheader-text {
+                color: #f3f4f6;
+            }
+            .stTabs [data-baseweb="tab"] {
+                color: #f3f4f6;
+            }
+            .stTabs [data-baseweb="tab"]:hover {
+                background: #6b7280;
+            }
+            </style>
+        """, unsafe_allow_html=True)
 
-    st.header("📅 Select Expiry Dates")
-    expiry_nfo = st.date_input("NFO Expiry Date", value=datetime(2025, 8, 28), help="Format: YYYY-MM-DD")
-    expiry_bfo = st.date_input("BFO Expiry Date", value=datetime(2025, 8, 26), help="Format: YYYY-MM-DD")
+# Sidebar for inputs with improved UX
+with st.sidebar:
+    st.markdown('<h2 class="text-lg font-bold text-gray-800 dark:text-gray-200 mb-4">📁 Upload Data</h2>', unsafe_allow_html=True)
+    positions_file = st.file_uploader("Positions CSV", type="csv", help="Upload VS20 22 AUG 2025 POSITIONS(EOD).csv", key="positions_upload")
+    
+    include_settlement_nfo = st.checkbox("Include Settlement PNL for NFO", value=True, help="Uncheck to exclude settlement PNL for NFO", key="nfo_settlement")
+    include_settlement_bfo = st.checkbox("Include Settlement PNL for BFO", value=True, help="Uncheck to exclude settlement PNL for BFO", key="bfo_settlement")
 
-    st.header("⚙️ Calculation Options")
-    include_unrealized_nfo = st.checkbox("Include Unrealized PNL for NFO", value=True, help="Uncheck to exclude unrealized PNL calculations for NFO")
-    include_unrealized_bfo = st.checkbox("Include Unrealized PNL for BFO", value=True, help="Uncheck to exclude unrealized PNL calculations for BFO")
+    if include_settlement_nfo:
+        nfo_bhav_file = st.file_uploader("NFO Bhavcopy", type="csv", help="Upload op220825.csv", key="nfo_upload")
+    else:
+        nfo_bhav_file = None
+        st.info("NFO bhavcopy not required when settlement PNL for NFO is disabled.")
 
-    process_button = st.button("🚀 Process Data")
+    if include_settlement_bfo:
+        bfo_bhav_file = st.file_uploader("BFO Bhavcopy", type="csv", help="Upload MS_20250822-01.csv", key="bfo_upload")
+    else:
+        bfo_bhav_file = None
+        st.info("BFO bhavcopy not required when settlement PNL for BFO is disabled.")
 
-# Main content
-st.title("📈 Ultimate Financial PNL Dashboard")
-st.markdown("Analyze your portfolio with ease. Upload files, select dates, and choose whether to include unrealized PNL for NFO and BFO. Explore interactive visualizations to make informed trading decisions.")
+    st.markdown('<h2 class="text-lg font-bold text-gray-800 dark:text-gray-200 mb-4">📅 Expiry Dates</h2>', unsafe_allow_html=True)
+    expiry_nfo = st.date_input("NFO Expiry Date", value=datetime(2025, 8, 28), help="Format: YYYY-MM-DD", key="nfo_expiry", disabled=not include_settlement_nfo)
+    expiry_bfo = st.date_input("BFO Expiry Date", value=datetime(2025, 8, 26), help="Format: YYYY-MM-DD", key="bfo_expiry", disabled=not include_settlement_bfo)
+
+    process_button = st.button("🚀 Process Data", key="process_button")
+
+# Main content with enhanced typography and layout
+st.markdown('<h1 class="header-text">📈 Ultimate Financial PNL Dashboard</h1>', unsafe_allow_html=True)
+st.markdown('<p class="subheader-text">Analyze your portfolio with real-time insights, interactive charts, and comprehensive data exports for smarter trading decisions.</p>', unsafe_allow_html=True)
 
 if process_button:
-    if positions_file and nfo_bhav_file and bfo_bhav_file:
-        try:
-            with st.spinner("🔄 Processing your data..."):
-                results = process_data(positions_file, nfo_bhav_file, bfo_bhav_file, expiry_nfo, expiry_bfo, include_unrealized_nfo, include_unrealized_bfo)
+    if positions_file:
+        if (include_settlement_nfo and nfo_bhav_file is None) or (include_settlement_bfo and bfo_bhav_file is None):
+            st.error("⚠️ Please upload all required CSV files for enabled settlement calculations.")
+        else:
+            try:
+                with st.spinner("🔄 Processing your data..."):
+                    results = process_data(positions_file, nfo_bhav_file, bfo_bhav_file, expiry_nfo, expiry_bfo, include_settlement_nfo, include_settlement_bfo)
 
-            # Key Metrics Section
-            st.header("🔑 Key Financial Metrics")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                color = get_color(results["overall_realized"])
-                st.markdown(f'<div class="metric-card"><p class="metric-label">Overall Realized PNL</p><p class="metric-value" style="color:{color};">₹{results["overall_realized"]:,.2f}</p></div>', unsafe_allow_html=True)
-            with col2:
-                color = get_color(results["overall_unrealized"])
-                st.markdown(f'<div class="metric-card"><p class="metric-label">Overall Unrealized PNL</p><p class="metric-value" style="color:{color};">₹{results["overall_unrealized"]:,.2f}</p></div>', unsafe_allow_html=True)
-            with col3:
-                color = get_color(results["grand_total"])
-                st.markdown(f'<div class="metric-card"><p class="metric-label">Grand Total PNL</p><p class="metric-value" style="color:{color};">₹{results["grand_total"]:,.2f}</p></div>', unsafe_allow_html=True)
+                # Key Metrics Section with improved grid layout
+                st.markdown('<h2 class="text-xl font-bold text-gray-800 dark:text-gray-200 mt-8 mb-4">🔑 Key Financial Metrics</h2>', unsafe_allow_html=True)
+                col1, col2, col3 = st.columns(3, gap="medium")
+                with col1:
+                    color = '#34D399' if results["overall_realized"] > 0 else '#F87171' if results["overall_realized"] < 0 else '#9CA3AF'
+                    st.markdown(f'<div class="metric-card"><p class="metric-label">Overall Realized PNL</p><p class="metric-value" style="color:{color};">₹{results["overall_realized"]:,.2f}</p></div>', unsafe_allow_html=True)
+                if include_settlement_nfo or include_settlement_bfo:
+                    with col2:
+                        color = '#34D399' if results["overall_settlement"] > 0 else '#F87171' if results["overall_settlement"] < 0 else '#9CA3AF'
+                        st.markdown(f'<div class="metric-card"><p class="metric-label">Overall Settlement PNL</p><p class="metric-value" style="color:{color};">₹{results["overall_settlement"]:,.2f}</p></div>', unsafe_allow_html=True)
+                with col3:
+                    color = '#34D399' if results["grand_total"] > 0 else '#F87171' if results["grand_total"] < 0 else '#9CA3AF'
+                    st.markdown(f'<div class="metric-card"><p class="metric-label">Grand Total PNL</p><p class="metric-value" style="color:{color};">₹{results["grand_total"]:,.2f}</p></div>', unsafe_allow_html=True)
 
-            col4, col5, col6, col7 = st.columns(4)
-            with col4:
-                color = get_color(results["total_realized_nfo"])
-                st.markdown(f'<div class="metric-card"><p class="metric-label">NFO Realized PNL</p><p class="metric-value" style="color:{color};">₹{results["total_realized_nfo"]:,.2f}</p></div>', unsafe_allow_html=True)
-            with col5:
-                color = get_color(results["total_unrealized_nfo"])
-                st.markdown(f'<div class="metric-card"><p class="metric-label">NFO Unrealized PNL</p><p class="metric-value" style="color:{color};">₹{results["total_unrealized_nfo"]:,.2f}</p></div>', unsafe_allow_html=True)
-            with col6:
-                color = get_color(results["total_realized_bfo"])
-                st.markdown(f'<div class="metric-card"><p class="metric-label">BFO Realized PNL</p><p class="metric-value" style="color:{color};">₹{results["total_realized_bfo"]:,.2f}</p></div>', unsafe_allow_html=True)
-            with col7:
-                color = get_color(results["total_unrealized_bfo"])
-                st.markdown(f'<div class="metric-card"><p class="metric-label">BFO Unrealized PNL</p><p class="metric-value" style="color:{color};">₹{results["total_unrealized_bfo"]:,.2f}</p></div>', unsafe_allow_html=True)
+                col4, col5, col6, col7 = st.columns(4, gap="medium")
+                with col4:
+                    color = '#34D399' if results["total_realized_nfo"] > 0 else '#F87171' if results["total_realized_nfo"] < 0 else '#9CA3AF'
+                    st.markdown(f'<div class="metric-card"><p class="metric-label">NFO Realized PNL</p><p class="metric-value" style="color:{color};">₹{results["total_realized_nfo"]:,.2f}</p></div>', unsafe_allow_html=True)
+                if include_settlement_nfo:
+                    with col5:
+                        color = '#34D399' if results["total_settlement_nfo"] > 0 else '#F87171' if results["total_settlement_nfo"] < 0 else '#9CA3AF'
+                        st.markdown(f'<div class="metric-card"><p class="metric-label">NFO Settlement PNL</p><p class="metric-value" style="color:{color};">₹{results["total_settlement_nfo"]:,.2f}</p></div>', unsafe_allow_html=True)
+                with col6:
+                    color = '#34D399' if results["total_realized_bfo"] > 0 else '#F87171' if results["total_realized_bfo"] < 0 else '#9CA3AF'
+                    st.markdown(f'<div class="metric-card"><p class="metric-label">BFO Realized PNL</p><p class="metric-value" style="color:{color};">₹{results["total_realized_bfo"]:,.2f}</p></div>', unsafe_allow_html=True)
+                if include_settlement_bfo:
+                    with col7:
+                        color = '#34D399' if results["total_settlement_bfo"] > 0 else '#F87171' if results["total_settlement_bfo"] < 0 else '#9CA3AF'
+                        st.markdown(f'<div class="metric-card"><p class="metric-label">BFO Settlement PNL</p><p class="metric-value" style="color:{color};">₹{results["total_settlement_bfo"]:,.2f}</p></div>', unsafe_allow_html=True)
 
-            # Interactive Tabs
-            tab1, tab2, tab3, tab4 = st.tabs(["📊 NFO Data", "📊 BFO Data", "📈 Visualizations", "💡 Insights"])
-
-            with tab1:
-                st.subheader("NFO Processed Data")
-                st.dataframe(results["df_nfo"].style.background_gradient(cmap='RdYlGn', subset=['Calculated_Realized_PNL', 'Calculated_Unrealized_PNL']).format({"Calculated_Realized_PNL": "₹{:.2f}", "Calculated_Unrealized_PNL": "₹{:.2f}"}, na_rep="N/A"), use_container_width=True)
-                st.markdown(get_csv_download_link(results["df_nfo"], "pos_nfo.csv"), unsafe_allow_html=True)
-
-                with st.expander("Aggregated NFO by Symbol"):
-                    st.dataframe(results["nfo_agg"].style.background_gradient(cmap='RdYlGn', subset=['Total_PNL']).format({"Total_PNL": "₹{:.2f}"}, na_rep="N/A"), use_container_width=True)
-
-            with tab2:
-                st.subheader("BFO Processed Data")
-                st.dataframe(results["df_bfo"].style.background_gradient(cmap='RdYlGn', subset=['Calculated_Realized_PNL', 'Calculated_Unrealized_PNL']).format({"Calculated_Realized_PNL": "₹{:.2f}", "Calculated_Unrealized_PNL": "₹{:.2f}"}, na_rep="N/A"), use_container_width=True)
-                st.markdown(get_csv_download_link(results["df_bfo"], "pos_bfo.csv"), unsafe_allow_html=True)
-
-                with st.expander("Aggregated BFO by Symbol"):
-                    st.dataframe(results["bfo_agg"].style.background_gradient(cmap='RdYlGn', subset=['Total_PNL']).format({"Total_PNL": "₹{:.2f}"}, na_rep="N/A"), use_container_width=True)
-
-            with tab3:
-                st.subheader("Interactive PNL Visualizations")
-                st.markdown('<div class="chart-container">', unsafe_allow_html=True)
-
-                # PNL Breakdown Bar Chart
-                pnl_data = pd.DataFrame({
-                    "Category": ["NFO Realized", "NFO Unrealized", "BFO Realized", "BFO Unrealized"],
-                    "PNL": [results["total_realized_nfo"], results["total_unrealized_nfo"],
-                            results["total_realized_bfo"], results["total_unrealized_bfo"]]
-                })
-                fig_bar = px.bar(pnl_data, x="Category", y="PNL", color="Category",
-                                 title="PNL Breakdown by Category",
-                                 color_discrete_sequence=px.colors.qualitative.Bold,
-                                 labels={"PNL": "Profit/Loss (₹)"},
-                                 text_auto='.2s')
-                fig_bar.update_layout(hovermode="x unified", showlegend=False, title_x=0.5)
-                st.plotly_chart(fig_bar, use_container_width=True)
-
-                # Overall PNL Pie Chart (only if unrealized is included)
-                if include_unrealized_nfo or include_unrealized_bfo:
-                    overall_pnl = pd.DataFrame({
-                        "Type": ["Realized", "Unrealized"],
-                        "Value": [abs(results["overall_realized"]), abs(results["overall_unrealized"])]
+                # Comprehensive Results and Summary Excel Download
+                st.markdown('<h2 class="text-xl font-bold text-gray-800 dark:text-gray-200 mt-8 mb-4">📥 Download Results</h2>', unsafe_allow_html=True)
+                col_download1 = st.columns(1)[0]  # Single column for single file download
+                with col_download1:
+                    # Create DataFrame for the requested format with dynamically calculated values
+                    pnl_breakdown_df = pd.DataFrame({
+                        'Date': [datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+                        'NFO Realized PNL': [results["total_realized_nfo"]],
+                        'NFO Settlement PNL': [results["total_settlement_nfo"] if include_settlement_nfo else 0],
+                        'Nfo total': [results["total_realized_nfo"] + (results["total_settlement_nfo"] if include_settlement_nfo else 0)],
+                        'BFO Realized PNL': [results["total_realized_bfo"]],
+                        'BFO Settlement PNL': [results["total_settlement_bfo"] if include_settlement_bfo else 0],
+                        'BFO total': [results["total_realized_bfo"] + (results["total_settlement_bfo"] if include_settlement_bfo else 0)],
+                        'Grand Total PNL': [results["grand_total"]]
                     })
-                    fig_pie = px.pie(overall_pnl, values="Value", names="Type",
-                                     title="Overall PNL Distribution (Absolute Values)",
-                                     color_discrete_sequence=px.colors.qualitative.Pastel,
-                                     hole=0.3)
-                    fig_pie.update_traces(textinfo='percent+label')
-                    st.plotly_chart(fig_pie, use_container_width=True)
+                    st.markdown(get_excel_download_link(pnl_breakdown_df, "A19_data"), unsafe_allow_html=True)
 
-                # NFO Strike vs PNL Scatter (only if unrealized NFO is included)
-                if include_unrealized_nfo and not results["df_nfo"].empty and 'Strike' in results["df_nfo"].columns:
-                    fig_scatter_nfo = px.scatter(results["df_nfo"], x="Strike", y="Calculated_Unrealized_PNL",
-                                                 color="Option_Type", size=abs(results["df_nfo"]["Net Qty"]),
-                                                 title="NFO: Unrealized PNL vs Strike Price",
-                                                 hover_data=["Symbol", "SETTLEMENT", "Net Qty"],
-                                                 labels={"Calculated_Unrealized_PNL": "Unrealized PNL (₹)"},
-                                                 opacity=0.8)
-                    fig_scatter_nfo.update_layout(transition_duration=500, title_x=0.5)
-                    st.plotly_chart(fig_scatter_nfo, use_container_width=True)
-
-                # Cumulative PNL Line Chart
-                pnl_data['Cumulative'] = pnl_data['PNL'].cumsum()
-                fig_line = px.line(pnl_data, x="Category", y="Cumulative",
-                                   title="Cumulative PNL Across Categories",
-                                   markers=True, line_shape="spline",
-                                   labels={"Cumulative": "Cumulative PNL (₹)"})
-                fig_line.update_traces(line=dict(width=4))
-                st.plotly_chart(fig_line, use_container_width=True)
-
-                # Heatmap for NFO PNL by Strike and Type (only if unrealized NFO is included)
-                if include_unrealized_nfo and not results["df_nfo"].empty and 'Strike' in results["df_nfo"].columns:
-                    pivot = results["df_nfo"].pivot_table(values='Calculated_Unrealized_PNL', index='Strike', columns='Option_Type', aggfunc='sum')
-                    fig_heat = go.Figure(data=go.Heatmap(
-                        z=pivot.values,
-                        x=pivot.columns,
-                        y=pivot.index,
-                        colorscale='RdYlGn',
-                        hoverongaps=False,
-                        text=pivot.values,
-                        texttemplate="₹%{text:,.2f}",
-                        hovertemplate="Strike: %{y}<br>Option Type: %{x}<br>PNL: ₹%{z:,.2f}<extra></extra>"
-                    ))
-                    fig_heat.update_layout(title="NFO Unrealized PNL Heatmap by Strike and Option Type", title_x=0.5)
-                    st.plotly_chart(fig_heat, use_container_width=True)
-
-                # Treemap for Aggregated PNL
-                treemap_data = pd.concat([
-                    results["nfo_agg"][['Symbol', 'Total_PNL']].assign(Exchange='NFO'),
-                    results["bfo_agg"][['Symbol', 'Total_PNL']].assign(Exchange='BFO')
-                ])
-                fig_tree = px.treemap(treemap_data, path=['Exchange', 'Symbol'], values='Total_PNL',
-                                      color='Total_PNL', color_continuous_scale='RdYlGn',
-                                      title="PNL Treemap by Exchange and Symbol")
-                fig_tree.update_layout(title_x=0.5)
-                st.plotly_chart(fig_tree, use_container_width=True)
-
-                st.markdown('</div>', unsafe_allow_html=True)
-
-            with tab4:
-                st.subheader("Key Insights & Recommendations")
-                st.markdown('<div class="insights-box">', unsafe_allow_html=True)
-
-                st.write("**Top 5 Gainers (NFO):**")
-                st.dataframe(results["top_gainers_nfo"].style.background_gradient(cmap='Greens', subset=['Total_PNL']).format({"Total_PNL": "₹{:.2f}"}, na_rep="N/A"))
-
-                st.write("**Top 5 Losers (NFO):**")
-                st.dataframe(results["top_losers_nfo"].style.background_gradient(cmap='Reds', subset=['Total_PNL']).format({"Total_PNL": "₹{:.2f}"}, na_rep="N/A"))
-
-                st.write("**Top 5 Gainers (BFO):**")
-                st.dataframe(results["top_gainers_bfo"].style.background_gradient(cmap='Greens', subset=['Total_PNL']).format({"Total_PNL": "₹{:.2f}"}, na_rep="N/A"))
-
-                st.write("**Top 5 Losers (BFO):**")
-                st.dataframe(results["top_losers_bfo"].style.background_gradient(cmap='Reds', subset=['Total_PNL']).format({"Total_PNL": "₹{:.2f}"}, na_rep="N/A"))
-
-                # Insights based on data
-                if results["grand_total"] > 0:
-                    st.success("🎉 Overall portfolio is in profit! Consider securing gains or scaling positions.")
-                else:
-                    st.warning("⚠️ Overall portfolio is in loss. Review high-loss positions and consider hedging strategies.")
-
-                # Exposure analysis
-                if not results["df_nfo"].empty:
-                    net_exposure_nfo = results["df_nfo"]["Net Qty"].abs().sum()
-                    st.info(f"**NFO Exposure**: {net_exposure_nfo:,.0f} units")
-                if not results["df_bfo"].empty:
-                    net_exposure_bfo = results["df_bfo"]["Net Qty"].abs().sum()
-                    st.info(f"**BFO Exposure**: {net_exposure_bfo:,.0f} units")
-
-                st.markdown('</div>', unsafe_allow_html=True)
-
-        except Exception as e:
-            st.error(f"⚠️ Error processing data: {str(e)}")
-            st.info("Please ensure all uploaded CSV files have the correct columns and data format. Check the log for details.")
+            except Exception as e:
+                st.error(f"⚠️ Error processing data: {str(e)}")
+                st.info("Please ensure all uploaded CSV files have the correct columns and data format. Check the log for details.")
     else:
-        st.error("⚠️ Please upload all required CSV files to proceed.")
+        st.error("⚠️ Please upload the positions CSV file to proceed.")
